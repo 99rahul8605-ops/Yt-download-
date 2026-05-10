@@ -16,10 +16,9 @@ import re
 import shutil
 import tempfile
 from pathlib import Path
-from typing import Dict, Optional, Tuple, Any
+from typing import Dict, Optional, Any
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.constants import ParseMode
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -247,7 +246,6 @@ async def download_media(
         downloaded_files = []
         if media_type == "thumbnail":
             # Thumbnail file is named like the video title + ".jpg" (or .png)
-            # yt-dlp saves it with the video ID and a ".jpg" extension
             for f in os.listdir(tmp_dir):
                 if f.endswith((".jpg", ".jpeg", ".png", ".webp")):
                     downloaded_files.append(os.path.join(tmp_dir, f))
@@ -291,7 +289,7 @@ async def download_media(
             task = asyncio.create_task(_cleanup())
             cleanup_tasks[user_id] = task
         else:
-            # "Never" – leave files, but we may still remove at server restart (Render ephemeral)
+            # "Never" – leave files
             logger.info(f"Skipping cleanup for user {user_id} (timer = Never)")
 
     except (DownloadError, ExtractorError) as e:
@@ -404,10 +402,11 @@ async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         await query.edit_message_text(f"✅ Cleanup timer set to: {'Never' if cleanup is None else f'{cleanup} min'}")
 
     elif data == "back_settings":
-        # Go back to main settings menu
-        await settings_command(update, context)
+        # This approach won't work directly because we need to send a new message.
+        # Instead, we delete the current message and rely on user to re‑open /settings.
+        await query.edit_message_text("Return to /settings to see the main menu again.")
+        # Alternatively, we can just delete it.
         await query.delete_message()
-        return
 
     elif data == "close_settings":
         await query.edit_message_text("Settings closed.")
@@ -462,7 +461,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             await progress_msg.edit_text(f"❌ Search failed: {e}")
 
 
-# ---------- Media Type / Search Selection Callback ----------
+# ---------- Media Type / Search Selection Callback (FIXED) ----------
 async def media_type_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle the initial video/audio/thumbnail choice or search result click."""
     query = update.callback_query
@@ -474,7 +473,13 @@ async def media_type_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
 
     if data.startswith("type_"):
-        _, media_type, url = data.split("|", 2)
+        # FIX: data format is "type_video|URL" (2 parts), not 3.
+        parts = data.split("|", 1)
+        if len(parts) != 2:
+            await query.edit_message_text("❌ Invalid selection.")
+            return
+        type_part, url = parts
+        media_type = type_part.split("_", 1)[1]  # "video", "audio", "thumb"
         user_id = query.from_user.id
         settings = get_user_settings(user_id)
 
@@ -485,14 +490,13 @@ async def media_type_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
                 await query.edit_message_text(f"⏳ Downloading video in {quality}...")
                 await download_media(update, context, url, "video", quality=quality)
             else:
-                # Manual: fetch dynamic formats and show buttons
+                # Manual: fetch dynamic qualities
                 await query.edit_message_text("🔍 Fetching available qualities...")
                 try:
                     loop = asyncio.get_running_loop()
                     with YoutubeDL({"quiet": True}) as ydl:
                         info = await loop.run_in_executor(None, lambda: ydl.extract_info(url, download=False))
                     formats = info.get("formats", [])
-                    # Build quality buttons (unique heights, sorted)
                     seen = set()
                     heights = []
                     for f in formats:
@@ -502,11 +506,9 @@ async def media_type_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
                             heights.append(h)
                     heights.sort()
                     if not heights:
-                        # fallback to "best"
                         await query.edit_message_text("⚠ No MP4 formats found, using best available.")
                         await download_media(update, context, url, "video", quality="best")
                         return
-
                     buttons = []
                     for h in heights:
                         buttons.append([InlineKeyboardButton(f"{h}p", callback_data=f"quality_manual|{url}|{h}")])
@@ -528,12 +530,13 @@ async def media_type_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
             await download_media(update, context, url, "thumbnail")
 
     elif data.startswith("quality_manual"):
-        _, url, quality = data.split("|")
+        # data: "quality_manual|url|height"
+        _, url, quality = data.split("|", 2)
         await query.edit_message_text(f"⬇ Downloading video in {quality}...")
         await download_media(update, context, url, "video", quality=quality)
 
     elif data.startswith("search_result"):
-        # Treat as a URL click from search results – show media type menu
+        # data: "search_result|url"
         _, vid_url = data.split("|", 1)
         keyboard = [
             [InlineKeyboardButton("🎬 Video", callback_data=f"type_video|{vid_url}")],
@@ -545,6 +548,21 @@ async def media_type_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
             "What would you like to download?",
             reply_markup=InlineKeyboardMarkup(keyboard),
         )
+
+
+# ---------- Error Handler (to prevent "No error handlers" log) ----------
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Log the error and send a friendly message to the user."""
+    logger.error(msg="Exception while handling an update:", exc_info=context.error)
+    # If possible, notify the user
+    if isinstance(update, Update) and update.effective_chat:
+        try:
+            await context.bot.send_message(
+                chat_id=update.effective_chat.id,
+                text="❌ An internal error occurred. Please try again later.",
+            )
+        except Exception:
+            pass
 
 
 # ---------- Main ----------
@@ -562,6 +580,9 @@ def main() -> None:
     app.add_handler(CallbackQueryHandler(settings_callback, pattern="^(set_|quality_|mode_|cleanup_|back_settings|close_settings)"))
     app.add_handler(CallbackQueryHandler(media_type_callback, pattern="^(type_|search_|quality_manual|search_cancel|type_cancel)"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+
+    # Register the error handler
+    app.add_error_handler(error_handler)
 
     # Start polling
     logger.info("Bot started. Press Ctrl+C to stop.")
