@@ -6,6 +6,7 @@ Advanced Telegram YouTube Downloader Bot
 - Async, python-telegram-bot v20+
 - Document‑only uploads
 - FFmpeg mandatory
+- Automatic format fallback if requested quality unavailable
 - Cookies support via COOKIES_BASE64 env variable
 """
 
@@ -34,8 +35,6 @@ from yt_dlp import YoutubeDL
 from yt_dlp.utils import DownloadError, ExtractorError
 
 # ---------- Optional: Health check HTTP server (for Render Web Service) ----------
-# If you use a Render Web Service (not Worker), you need to bind to PORT.
-# Set ENABLE_HEALTH_SERVER=True in env vars to activate this.
 if os.environ.get("ENABLE_HEALTH_SERVER", "").lower() == "true":
     from aiohttp import web
 
@@ -44,7 +43,7 @@ if os.environ.get("ENABLE_HEALTH_SERVER", "").lower() == "true":
 
     async def start_health_server(port: int):
         app = web.Application()
-        app.router.add_get("/", health)   # Render checks GET /
+        app.router.add_get("/", health)
         app.router.add_get("/health", health)
         runner = web.AppRunner(app)
         await runner.setup()
@@ -68,7 +67,6 @@ logger = logging.getLogger(__name__)
 COOKIES_FILE = "cookies.txt"
 
 def setup_cookies():
-    """Write cookies file from COOKIES_BASE64 environment variable if present."""
     cookies_b64 = os.environ.get("COOKIES_BASE64", "").strip()
     if cookies_b64:
         try:
@@ -92,7 +90,6 @@ DEFAULT_SETTINGS = {
 user_settings: Dict[int, dict] = {}
 cleanup_tasks: Dict[int, asyncio.Task] = {}
 
-
 def load_settings() -> None:
     global user_settings
     if SETTINGS_FILE.exists():
@@ -106,7 +103,6 @@ def load_settings() -> None:
     else:
         user_settings = {}
 
-
 def save_settings() -> None:
     try:
         with open(SETTINGS_FILE, "w") as f:
@@ -114,21 +110,19 @@ def save_settings() -> None:
     except Exception as e:
         logger.error(f"Failed to save settings: {e}")
 
-
 def get_user_settings(user_id: int) -> dict:
     if user_id not in user_settings:
         user_settings[user_id] = DEFAULT_SETTINGS.copy()
         save_settings()
     return user_settings[user_id]
 
-
 def update_user_setting(user_id: int, key: str, value: Any) -> None:
     settings = get_user_settings(user_id)
     settings[key] = value
     save_settings()
 
-
 # ---------- Format helpers ----------
+# These are the preferred selectors. If they fail, the fallback uses "bestvideo+bestaudio/best"
 QUALITY_TO_FORMAT = {
     "360p": "bestvideo[height<=360][ext=mp4]+bestaudio[ext=m4a]/best[height<=360][ext=mp4]/best[height<=360]",
     "480p": "bestvideo[height<=480][ext=mp4]+bestaudio[ext=m4a]/best[height<=480][ext=mp4]/best[height<=480]",
@@ -137,20 +131,16 @@ QUALITY_TO_FORMAT = {
     "best": "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
 }
 
-
 def quality_to_ytdl_format(quality: str) -> str:
     return QUALITY_TO_FORMAT.get(quality, QUALITY_TO_FORMAT["best"])
-
 
 # ---------- YouTube URL & Search ----------
 YOUTUBE_URL_RE = re.compile(
     r"(https?://)?(www\.)?(youtube\.com/watch\?v=|youtu\.be/|youtube\.com/shorts/)[\w-]+"
 )
 
-
 def is_youtube_url(text: str) -> bool:
     return bool(YOUTUBE_URL_RE.search(text))
-
 
 # ---------- Progress Hook ----------
 class ProgressHook:
@@ -193,8 +183,7 @@ class ProgressHook:
         except Exception as e:
             logger.debug(f"Progress edit failed: {e}")
 
-
-# ---------- Core Download Engine ----------
+# ---------- Core Download Engine (with format fallback) ----------
 async def download_media(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
@@ -215,55 +204,75 @@ async def download_media(
     )
     progress_callback = ProgressHook(context.bot, chat_id, progress_msg.message_id)
 
-    ydl_opts = {
-        "outtmpl": outtmpl,
-        "quiet": True,
-        "no_warnings": True,
-        "progress_hooks": [progress_callback],
-        "cookiefile": COOKIES_FILE,   # Will use the file created by setup_cookies()
-        "merge_output_format": "mp4",
-    }
-
-    if media_type == "audio":
-        ydl_opts.update({
-            "format": "bestaudio/best",
-            "postprocessors": [
-                {
+    def build_opts(fmt: str) -> dict:
+        """Build yt-dlp options with the given format string."""
+        opts = {
+            "outtmpl": outtmpl,
+            "quiet": True,
+            "no_warnings": True,
+            "progress_hooks": [progress_callback],
+            "cookiefile": COOKIES_FILE,
+            "merge_output_format": "mp4",
+            "format": fmt,
+        }
+        if media_type == "audio":
+            opts.update({
+                "format": "bestaudio/best",
+                "postprocessors": [{
                     "key": "FFmpegExtractAudio",
                     "preferredcodec": "mp3",
                     "preferredquality": "192",
-                }
-            ],
-        })
-    elif media_type == "video":
-        fmt = quality_to_ytdl_format(quality) if quality else quality_to_ytdl_format("best")
-        ydl_opts["format"] = fmt
-        ydl_opts.setdefault("postprocessors", [])
-        ydl_opts["postprocessors"].append({"key": "FFmpegVideoConvertor", "preferedformat": "mp4"})
-    elif media_type == "thumbnail":
-        ydl_opts.update({
-            "writethumbnail": True,
-            "skip_download": True,
-        })
-    else:
-        raise ValueError("Invalid media type")
+                }],
+            })
+            return opts
+        elif media_type == "video":
+            # The passed fmt is already set; add merge postprocessor
+            opts.setdefault("postprocessors", [])
+            opts["postprocessors"].append({"key": "FFmpegVideoConvertor", "preferedformat": "mp4"})
+            return opts
+        elif media_type == "thumbnail":
+            opts.update({
+                "writethumbnail": True,
+                "skip_download": True,
+            })
+            return opts
+        else:
+            raise ValueError("Invalid media type")
 
-    try:
+    async def attempt_download(fmt: str) -> list:
+        """Run download with given format string. Returns list of file paths or raises."""
+        opts = build_opts(fmt)
         loop = asyncio.get_running_loop()
-        with YoutubeDL(ydl_opts) as ydl:
-            info = await loop.run_in_executor(None, lambda: ydl.extract_info(url, download=True))
-
-        downloaded_files = []
+        with YoutubeDL(opts) as ydl:
+            await loop.run_in_executor(None, lambda: ydl.extract_info(url, download=True))
+        # Collect files
         if media_type == "thumbnail":
             for f in os.listdir(tmp_dir):
                 if f.endswith((".jpg", ".jpeg", ".png", ".webp")):
-                    downloaded_files.append(os.path.join(tmp_dir, f))
-                    break
+                    return [os.path.join(tmp_dir, f)]
+            return []
         else:
+            files = []
             for f in os.listdir(tmp_dir):
                 fp = os.path.join(tmp_dir, f)
-                if os.path.isfile(fp):
-                    downloaded_files.append(fp)
+                if os.path.isfile(fp) and not fp.endswith(".part") and not fp.endswith(".ytdl"):
+                    files.append(fp)
+            return files
+
+    try:
+        # First try the requested quality (or best if none)
+        target_fmt = quality_to_ytdl_format(quality) if quality else quality_to_ytdl_format("best")
+        try:
+            downloaded_files = await attempt_download(target_fmt)
+        except (DownloadError, ExtractorError) as e:
+            error_text = str(e)
+            # If it's a format-unavailable error, try falling back to "best"
+            if "Requested format is not available" in error_text and media_type == "video":
+                await progress_msg.edit_text("⚠ Requested quality not available, falling back to best...")
+                target_fmt = quality_to_ytdl_format("best")
+                downloaded_files = await attempt_download(target_fmt)
+            else:
+                raise  # Re-raise other errors
 
         if not downloaded_files:
             await progress_msg.edit_text("❌ Download succeeded but no file found.")
@@ -301,7 +310,7 @@ async def download_media(
         elif "Video unavailable" in error_text or "This video is not available" in error_text:
             msg = "🚫 Video is unavailable (deleted or region‑blocked)."
         elif "sign in" in error_text.lower() or "confirm you're not a bot" in error_text.lower():
-            msg = "🔑 YouTube requires authentication. Please add valid cookies (see /help)."
+            msg = "🔑 YouTube requires authentication. Add valid cookies (use /help)."
         else:
             msg = f"❌ Download failed: {error_text[:200]}"
         await progress_msg.edit_text(msg)
@@ -310,7 +319,6 @@ async def download_media(
         await progress_msg.edit_text(f"❌ Unexpected error: {str(e)[:200]}")
         shutil.rmtree(tmp_dir, ignore_errors=True)
         logger.exception("Download error")
-
 
 # ---------- Handlers ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -324,8 +332,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
-        "🔐 If downloads fail with 'Sign in to confirm', you need to provide YouTube cookies.\n"
-        "See https://github.com/yt-dlp/yt-dlp/wiki/FAQ#how-do-i-pass-cookies-to-yt-dlp"
+        "🔐 If downloads fail with 'Sign in to confirm', provide YouTube cookies.\n"
+        "See https://github.com/yt-dlp/yt-dlp/wiki/FAQ#how-do-i-pass-cookies-to-yt-dlp\n\n"
+        "🎥 Format errors? The bot will automatically fall back to 'best' if the requested quality isn't available."
     )
 
 async def settings_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -337,7 +346,6 @@ async def settings_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
     await update.message.reply_text("⚙ Settings:", reply_markup=reply_markup)
-
 
 async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
@@ -407,7 +415,6 @@ async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         await query.edit_message_text("Settings closed.")
         await query.delete_message()
 
-
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     text = update.message.text.strip()
     if is_youtube_url(text):
@@ -443,9 +450,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         except Exception as e:
             await progress_msg.edit_text(f"❌ Search failed: {e}")
 
-
 # ------------------------------------------------------------
-# FIXED media_type_callback – no unpacking error
+# FIXED media_type_callback – correct parsing + fallback note
 # ------------------------------------------------------------
 async def media_type_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
@@ -457,13 +463,12 @@ async def media_type_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
 
     if data.startswith("type_"):
-        # CORRECT PARSING: "type_video|URL" → 2 parts
         parts = data.split("|", 1)
         if len(parts) != 2:
             await query.edit_message_text("❌ Invalid selection.")
             return
         type_part, url = parts
-        media_type = type_part.split("_", 1)[1]   # "video", "audio", "thumb"
+        media_type = type_part.split("_", 1)[1]
         user_id = query.from_user.id
         settings = get_user_settings(user_id)
 
@@ -524,7 +529,6 @@ async def media_type_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
         ]
         await query.edit_message_text("What would you like to download?", reply_markup=InlineKeyboardMarkup(keyboard))
 
-
 # ------------------------------------------------------------
 # ERROR HANDLER
 # ------------------------------------------------------------
@@ -539,21 +543,15 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
         except Exception:
             pass
 
-
 # ------------------------------------------------------------
 # MAIN
 # ------------------------------------------------------------
 async def main() -> None:
-    # 1. Setup cookies from environment variable (important!)
     setup_cookies()
-
-    # 2. Load persistent settings
     load_settings()
 
-    # 3. Build PTB application
     app = Application.builder().token(BOT_TOKEN).build()
 
-    # 4. Register handlers
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("settings", settings_command))
@@ -561,21 +559,17 @@ async def main() -> None:
     app.add_handler(CallbackQueryHandler(media_type_callback, pattern="^(type_|search_|quality_manual|search_cancel|type_cancel)"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    # 5. Error handler
     app.add_error_handler(error_handler)
 
-    # 6. Optional health server (only if ENABLE_HEALTH_SERVER=true)
     if os.environ.get("ENABLE_HEALTH_SERVER", "").lower() == "true":
         port = int(os.environ.get("PORT", 10000))
         asyncio.create_task(start_health_server(port))
 
-    # 7. Start bot
     logger.info("Bot started. Press Ctrl+C to stop.")
     await app.initialize()
     await app.start()
     await app.updater.start_polling(allowed_updates=Update.ALL_TYPES)
     await asyncio.Event().wait()
-
 
 if __name__ == "__main__":
     asyncio.run(main())
