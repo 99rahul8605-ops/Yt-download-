@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
 """
 Advanced Telegram YouTube Downloader Bot
-- yt-dlp powered
+- yt-dlp powered, Python 3.10+
 - Per‑user settings (quality, mode, cleanup timer)
 - Async, python-telegram-bot v20+
 - Document‑only uploads
 - FFmpeg mandatory
+- Cookies support via COOKIES_BASE64 env variable
 """
 
 import asyncio
+import base64
 import json
 import logging
 import os
@@ -61,6 +63,22 @@ logging.basicConfig(
     level=logging.INFO,
 )
 logger = logging.getLogger(__name__)
+
+# ---------- Cookies Setup ----------
+COOKIES_FILE = "cookies.txt"
+
+def setup_cookies():
+    """Write cookies file from COOKIES_BASE64 environment variable if present."""
+    cookies_b64 = os.environ.get("COOKIES_BASE64", "").strip()
+    if cookies_b64:
+        try:
+            with open(COOKIES_FILE, "wb") as f:
+                f.write(base64.b64decode(cookies_b64))
+            logger.info("Cookies loaded from COOKIES_BASE64 env variable")
+        except Exception as e:
+            logger.error(f"Failed to decode COOKIES_BASE64: {e}")
+    else:
+        logger.info("No COOKIES_BASE64 variable set – using local cookies.txt if present")
 
 # ---------- Global Settings Storage ----------
 SETTINGS_FILE = Path("settings.json")
@@ -202,7 +220,7 @@ async def download_media(
         "quiet": True,
         "no_warnings": True,
         "progress_hooks": [progress_callback],
-        "cookiefile": "cookies.txt",
+        "cookiefile": COOKIES_FILE,   # Will use the file created by setup_cookies()
         "merge_output_format": "mp4",
     }
 
@@ -282,8 +300,8 @@ async def download_media(
             msg = "🔒 This video is private."
         elif "Video unavailable" in error_text or "This video is not available" in error_text:
             msg = "🚫 Video is unavailable (deleted or region‑blocked)."
-        elif "sign in" in error_text.lower():
-            msg = "🔑 Age‑restricted or sign‑in required. Provide cookies.txt to bypass."
+        elif "sign in" in error_text.lower() or "confirm you're not a bot" in error_text.lower():
+            msg = "🔑 YouTube requires authentication. Please add valid cookies (see /help)."
         else:
             msg = f"❌ Download failed: {error_text[:200]}"
         await progress_msg.edit_text(msg)
@@ -300,9 +318,15 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "👋 Welcome to the YouTube Downloader Bot!\n\n"
         "• Send a YouTube link to download video/audio/thumbnail.\n"
         "• Send a song name to search.\n"
-        "• Use /settings to adjust quality, mode, and cleanup."
+        "• Use /settings to adjust quality, mode, and cleanup.\n"
+        "• /help for FAQ."
     )
 
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.message.reply_text(
+        "🔐 If downloads fail with 'Sign in to confirm', you need to provide YouTube cookies.\n"
+        "See https://github.com/yt-dlp/yt-dlp/wiki/FAQ#how-do-i-pass-cookies-to-yt-dlp"
+    )
 
 async def settings_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     keyboard = [
@@ -401,7 +425,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         progress_msg = await update.message.reply_text("🔍 Searching YouTube...")
         try:
             loop = asyncio.get_running_loop()
-            with YoutubeDL({"quiet": True, "extract_flat": True}) as ydl:
+            with YoutubeDL({"quiet": True, "extract_flat": True, "cookiefile": COOKIES_FILE}) as ydl:
                 info = await loop.run_in_executor(None, lambda: ydl.extract_info(f"ytsearch5:{text}", download=False))
             entries = info.get("entries", [])
             if not entries:
@@ -421,7 +445,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 
 # ------------------------------------------------------------
-# FIXED media_type_callback – NO unpacking error
+# FIXED media_type_callback – no unpacking error
 # ------------------------------------------------------------
 async def media_type_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
@@ -453,7 +477,7 @@ async def media_type_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
                 await query.edit_message_text("🔍 Fetching available qualities...")
                 try:
                     loop = asyncio.get_running_loop()
-                    with YoutubeDL({"quiet": True}) as ydl:
+                    with YoutubeDL({"quiet": True, "cookiefile": COOKIES_FILE}) as ydl:
                         info = await loop.run_in_executor(None, lambda: ydl.extract_info(url, download=False))
                     formats = info.get("formats", [])
                     seen = set()
@@ -502,7 +526,7 @@ async def media_type_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 
 # ------------------------------------------------------------
-# ERROR HANDLER – stops "No error handlers" warning
+# ERROR HANDLER
 # ------------------------------------------------------------
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     logger.error(msg="Exception while handling an update:", exc_info=context.error)
@@ -520,34 +544,36 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
 # MAIN
 # ------------------------------------------------------------
 async def main() -> None:
-    # Load settings
+    # 1. Setup cookies from environment variable (important!)
+    setup_cookies()
+
+    # 2. Load persistent settings
     load_settings()
 
-    # Build PTB application
+    # 3. Build PTB application
     app = Application.builder().token(BOT_TOKEN).build()
 
-    # Handlers
+    # 4. Register handlers
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("settings", settings_command))
     app.add_handler(CallbackQueryHandler(settings_callback, pattern="^(set_|quality_|mode_|cleanup_|back_settings|close_settings)"))
     app.add_handler(CallbackQueryHandler(media_type_callback, pattern="^(type_|search_|quality_manual|search_cancel|type_cancel)"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    # ERROR HANDLER REGISTRATION (this was missing before)
+    # 5. Error handler
     app.add_error_handler(error_handler)
 
-    # Optional health server (if ENABLE_HEALTH_SERVER=true)
+    # 6. Optional health server (only if ENABLE_HEALTH_SERVER=true)
     if os.environ.get("ENABLE_HEALTH_SERVER", "").lower() == "true":
         port = int(os.environ.get("PORT", 10000))
-        # Run health server in background
         asyncio.create_task(start_health_server(port))
 
-    # Start bot
+    # 7. Start bot
     logger.info("Bot started. Press Ctrl+C to stop.")
     await app.initialize()
     await app.start()
     await app.updater.start_polling(allowed_updates=Update.ALL_TYPES)
-    # Keep running
     await asyncio.Event().wait()
 
 
