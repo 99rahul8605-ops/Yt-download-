@@ -1,700 +1,572 @@
-import os
+#!/usr/bin/env python3
+"""
+Advanced Telegram YouTube Downloader Bot
+- yt-dlp powered
+- Per‑user settings (quality, mode, cleanup timer)
+- Async, python-telegram-bot v20+
+- Document‑only uploads
+- FFmpeg mandatory
+"""
+
 import asyncio
+import json
 import logging
+import os
+import re
+import shutil
+import tempfile
+from pathlib import Path
+from typing import Dict, Optional, Tuple, Any
+
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.constants import ParseMode
 from telegram.ext import (
     Application,
     CommandHandler,
     MessageHandler,
     CallbackQueryHandler,
-    ContextTypes,
     filters,
+    ContextTypes,
 )
-from telegram.constants import ParseMode
 
-from config import BOT_TOKEN, QUALITY_PRESETS, CLEANUP_TIMERS
-from settings_manager import settings_manager
-from downloader import downloader
-from utils import is_youtube_url, cleanup_scheduler, format_duration
+from yt_dlp import YoutubeDL
+from yt_dlp.utils import DownloadError, ExtractorError
 
-# Enable logging
+# ---------- Configuration ----------
+BOT_TOKEN = os.environ.get("BOT_TOKEN")
+if not BOT_TOKEN:
+    raise ValueError("Please set BOT_TOKEN environment variable")
+
+# ---------- Logging ----------
 logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.INFO,
 )
 logger = logging.getLogger(__name__)
 
-# User state management
-user_states = {}
+# ---------- Global Settings Storage ----------
+SETTINGS_FILE = Path("settings.json")
+
+DEFAULT_SETTINGS = {
+    "default_quality": "720p",       # 360p, 480p, 720p, 1080p, best
+    "download_mode": "manual",       # fixed or manual
+    "cleanup_timer": 10,             # minutes (None = never)
+}
+
+# In‑memory cache: user_id -> settings dict
+user_settings: Dict[int, dict] = {}
+
+# Track active cleanup tasks: {user_id: asyncio.Task}
+cleanup_tasks: Dict[int, asyncio.Task] = {}
 
 
-# ==================== COMMAND HANDLERS ====================
-
-async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /start command"""
-    welcome_message = """
-🎬 **Welcome to Advanced YouTube Downloader Bot!**
-
-📋 **Features:**
-✅ Download YouTube videos in any quality
-✅ Convert videos to MP3
-✅ Download thumbnails
-✅ Search videos by name
-✅ Customize your experience with settings
-
-🔧 **Commands:**
-/start - Show this message
-/settings - Configure your preferences
-/help - Get help
-
-📥 **How to use:**
-1️⃣ Send me a YouTube link
-2️⃣ Choose what you want (Video/Audio/Thumbnail)
-3️⃣ Select quality (if needed)
-4️⃣ Wait for your file!
-
-🔍 **Search:**
-Just send me a song/video name to search!
-
-Let's get started! 🚀
-"""
-    await update.message.reply_text(welcome_message, parse_mode=ParseMode.MARKDOWN)
+def load_settings() -> None:
+    """Load settings from JSON file into global cache."""
+    global user_settings
+    if SETTINGS_FILE.exists():
+        try:
+            with open(SETTINGS_FILE, "r") as f:
+                user_settings = json.load(f)
+                # Convert string keys back to int (JSON keys are strings)
+                user_settings = {int(k): v for k, v in user_settings.items()}
+            logger.info("Settings loaded from disk")
+        except Exception as e:
+            logger.error(f"Failed to load settings: {e}")
+    else:
+        user_settings = {}
 
 
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /help command"""
-    help_text = """
-📖 **Help & Guide**
-
-**Downloading Videos:**
-• Send any YouTube URL
-• Choose Video option
-• Select quality (or use your default)
-• Receive as document
-
-**Converting to MP3:**
-• Send any YouTube URL
-• Choose Audio (MP3) option
-• Wait for conversion
-• Receive as document
-
-**Downloading Thumbnails:**
-• Send any YouTube URL
-• Choose Thumbnail option
-• Receive image as document
-
-**Searching Videos:**
-• Send video/song name (not a URL)
-• Choose from search results
-• Continue normal flow
-
-**Settings:**
-Use /settings to customize:
-• Default video quality
-• Download mode (fixed/manual)
-• Auto-cleanup timer
-
-**Supported Sites:**
-Currently supports YouTube (more coming soon!)
-
-Need more help? Contact the developer!
-"""
-    await update.message.reply_text(help_text, parse_mode=ParseMode.MARKDOWN)
+def save_settings() -> None:
+    """Persist current settings cache to JSON file."""
+    try:
+        with open(SETTINGS_FILE, "w") as f:
+            json.dump(user_settings, f, indent=2)
+    except Exception as e:
+        logger.error(f"Failed to save settings: {e}")
 
 
-async def settings_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /settings command - show settings menu"""
+def get_user_settings(user_id: int) -> dict:
+    """Return settings for a user, filling defaults if missing."""
+    if user_id not in user_settings:
+        user_settings[user_id] = DEFAULT_SETTINGS.copy()
+        save_settings()
+    return user_settings[user_id]
+
+
+def update_user_setting(user_id: int, key: str, value: Any) -> None:
+    """Update a single setting and persist."""
+    settings = get_user_settings(user_id)
+    settings[key] = value
+    save_settings()
+
+
+# ---------- Format helpers ----------
+QUALITY_TO_FORMAT = {
+    "360p": "bestvideo[height<=360][ext=mp4]+bestaudio[ext=m4a]/best[height<=360][ext=mp4]/best[height<=360]",
+    "480p": "bestvideo[height<=480][ext=mp4]+bestaudio[ext=m4a]/best[height<=480][ext=mp4]/best[height<=480]",
+    "720p": "bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/best[height<=720][ext=mp4]/best[height<=720]",
+    "1080p": "bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/best[height<=1080][ext=mp4]/best[height<=1080]",
+    "best": "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
+}
+
+
+def quality_to_ytdl_format(quality: str) -> str:
+    """Translate a quality label to a yt-dlp format string."""
+    return QUALITY_TO_FORMAT.get(quality, QUALITY_TO_FORMAT["best"])
+
+
+# ---------- YouTube URL & Search ----------
+YOUTUBE_URL_RE = re.compile(
+    r"(https?://)?(www\.)?(youtube\.com/watch\?v=|youtu\.be/|youtube\.com/shorts/)[\w-]+"
+)
+
+YT_SEARCH_PREFIX = "ytsearch5:"
+
+
+def is_youtube_url(text: str) -> bool:
+    """Check if text is a YouTube video URL."""
+    return bool(YOUTUBE_URL_RE.search(text))
+
+
+# ---------- Progress Hook (thread‑safe) ----------
+class ProgressHook:
+    """Thread‑safe progress hook that edits a Telegram message."""
+
+    def __init__(self, bot, chat_id: int, message_id: int):
+        self.bot = bot
+        self.chat_id = chat_id
+        self.message_id = message_id
+        self.last_text = ""
+
+    def __call__(self, d: dict) -> None:
+        if d["status"] == "downloading":
+            percent = d.get("_percent_str", "N/A")
+            speed = d.get("_speed_str", "N/A")
+            eta = d.get("_eta_str", "N/A")
+            text = (
+                f"⬇ Downloading…\n"
+                f"▸ {percent.strip()}\n"
+                f"🚀 {speed.strip()}\n"
+                f"⏳ ETA: {eta.strip()}"
+            )
+        elif d["status"] == "finished":
+            text = "✅ Download finished, processing..."
+        else:
+            return
+
+        if text != self.last_text:
+            self.last_text = text
+            # Schedule the message edit in the main event loop
+            asyncio.run_coroutine_threadsafe(
+                self._edit_message(text),
+                self.bot.loop,
+            )
+
+    async def _edit_message(self, text: str) -> None:
+        try:
+            await self.bot.edit_message_text(
+                chat_id=self.chat_id,
+                message_id=self.message_id,
+                text=text,
+            )
+        except Exception as e:
+            logger.debug(f"Progress edit failed: {e}")
+
+
+# ---------- Core Download Engine ----------
+async def download_media(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    url: str,
+    media_type: str,          # "video", "audio", "thumbnail"
+    quality: Optional[str] = None,  # only for video, e.g. "720p"
+) -> None:
+    """
+    Download media in background, send as document, apply cleanup.
+    """
     user_id = update.effective_user.id
-    user_settings = await settings_manager.get_user_settings(user_id)
-    
-    keyboard = [
-        [InlineKeyboardButton("🎬 Default Video Quality", callback_data="setting_quality")],
-        [InlineKeyboardButton("🧹 Cleanup Timer", callback_data="setting_cleanup")],
-        [InlineKeyboardButton("🔁 Download Mode", callback_data="setting_mode")],
-        [InlineKeyboardButton("❌ Close", callback_data="setting_close")]
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    
-    settings_text = f"""
-⚙️ **Your Current Settings**
+    settings = get_user_settings(user_id)
+    chat_id = update.effective_chat.id
 
-🎬 **Default Quality:** {user_settings['default_quality']}
-🧹 **Cleanup Timer:** {user_settings['cleanup_timer']}
-🔁 **Download Mode:** {user_settings['download_mode']}
+    # Create temporary directory for this download
+    tmp_dir = tempfile.mkdtemp(prefix="ytdl_", dir=".")
+    # Unique file name base (yt-dlp will append extensions)
+    outtmpl = os.path.join(tmp_dir, "%(title).100s_%(id)s.%(ext)s")
 
-Tap a setting to change it:
-"""
-    
+    # Build progress message
+    progress_msg = await context.bot.send_message(
+        chat_id=chat_id,
+        text="⏳ Starting download...",
+    )
+    progress_callback = ProgressHook(context.bot, chat_id, progress_msg.message_id)
+
+    # yt-dlp options
+    ydl_opts = {
+        "outtmpl": outtmpl,
+        "quiet": True,
+        "no_warnings": True,
+        "progress_hooks": [progress_callback],
+        "cookiefile": "cookies.txt",  # optional, for age‑restricted content
+        "merge_output_format": "mp4",  # ensure final merge is mp4
+    }
+
+    if media_type == "audio":
+        ydl_opts.update({
+            "format": "bestaudio/best",
+            "postprocessors": [
+                {
+                    "key": "FFmpegExtractAudio",
+                    "preferredcodec": "mp3",
+                    "preferredquality": "192",
+                }
+            ],
+        })
+    elif media_type == "video":
+        # If quality specified, use that; otherwise best
+        fmt = quality_to_ytdl_format(quality) if quality else quality_to_ytdl_format("best")
+        ydl_opts["format"] = fmt
+        ydl_opts.setdefault("postprocessors", [])
+        # Ensure we merge video+audio if needed
+        ydl_opts["postprocessors"].append({"key": "FFmpegVideoConvertor", "preferedformat": "mp4"})
+    elif media_type == "thumbnail":
+        # Download only thumbnail
+        ydl_opts.update({
+            "writethumbnail": True,
+            "skip_download": True,  # don't download video
+        })
+    else:
+        raise ValueError("Invalid media type")
+
+    try:
+        # Run yt-dlp in a thread to avoid blocking the event loop
+        loop = asyncio.get_running_loop()
+        with YoutubeDL(ydl_opts) as ydl:
+            info = await loop.run_in_executor(None, lambda: ydl.extract_info(url, download=True))
+
+        # Find downloaded file(s)
+        downloaded_files = []
+        if media_type == "thumbnail":
+            # Thumbnail file is named like the video title + ".jpg" (or .png)
+            # yt-dlp saves it with the video ID and a ".jpg" extension
+            for f in os.listdir(tmp_dir):
+                if f.endswith((".jpg", ".jpeg", ".png", ".webp")):
+                    downloaded_files.append(os.path.join(tmp_dir, f))
+                    break
+        else:
+            # All other files in tmp_dir
+            for f in os.listdir(tmp_dir):
+                fp = os.path.join(tmp_dir, f)
+                if os.path.isfile(fp):
+                    downloaded_files.append(fp)
+
+        if not downloaded_files:
+            await progress_msg.edit_text("❌ Download succeeded but no file found.")
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+            return
+
+        # Send each file as document
+        for file_path in downloaded_files:
+            with open(file_path, "rb") as f:
+                await context.bot.send_document(
+                    chat_id=chat_id,
+                    document=f,
+                    filename=os.path.basename(file_path),
+                    caption=f"📥 {media_type.capitalize()} from YouTube",
+                )
+
+        await progress_msg.delete()
+
+        # Schedule cleanup based on user settings
+        cleanup_minutes = settings.get("cleanup_timer")
+        if cleanup_minutes is not None:
+            # Cancel any previous cleanup task for the user (just in case)
+            if user_id in cleanup_tasks and not cleanup_tasks[user_id].done():
+                cleanup_tasks[user_id].cancel()
+            # Schedule deletion
+            async def _cleanup():
+                await asyncio.sleep(cleanup_minutes * 60)
+                shutil.rmtree(tmp_dir, ignore_errors=True)
+                logger.info(f"Cleaned up files for user {user_id}")
+
+            task = asyncio.create_task(_cleanup())
+            cleanup_tasks[user_id] = task
+        else:
+            # "Never" – leave files, but we may still remove at server restart (Render ephemeral)
+            logger.info(f"Skipping cleanup for user {user_id} (timer = Never)")
+
+    except (DownloadError, ExtractorError) as e:
+        error_text = str(e)
+        if "Private video" in error_text or "This video is private" in error_text:
+            msg = "🔒 This video is private."
+        elif "Video unavailable" in error_text or "This video is not available" in error_text:
+            msg = "🚫 Video is unavailable (deleted or region‑blocked)."
+        elif "sign in" in error_text.lower():
+            msg = "🔑 Age‑restricted or sign‑in required. Provide cookies.txt to bypass."
+        else:
+            msg = f"❌ Download failed: {error_text[:200]}"
+        await progress_msg.edit_text(msg)
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+    except Exception as e:
+        await progress_msg.edit_text(f"❌ Unexpected error: {str(e)[:200]}")
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        logger.exception("Download error")
+
+
+# ---------- Handlers ----------
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Send welcome message."""
     await update.message.reply_text(
-        settings_text,
-        reply_markup=reply_markup,
-        parse_mode=ParseMode.MARKDOWN
+        "👋 Welcome to the YouTube Downloader Bot!\n\n"
+        "• Send a YouTube link to download video/audio/thumbnail.\n"
+        "• Send a song name to search.\n"
+        "• Use /settings to adjust quality, mode, and cleanup."
     )
 
 
-# ==================== MESSAGE HANDLER ====================
-
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle text messages (URLs or search queries)"""
-    user_id = update.effective_user.id
-    text = update.message.text.strip()
-    
-    if is_youtube_url(text):
-        await handle_youtube_url(update, context, text)
-    else:
-        await handle_search_query(update, context, text)
-
-
-async def handle_youtube_url(update: Update, context: ContextTypes.DEFAULT_TYPE, url: str):
-    """Handle YouTube URL"""
-    user_id = update.effective_user.id
-    
-    # Send processing message
-    status_msg = await update.message.reply_text("🔍 Fetching video information...")
-    
-    try:
-        # Extract video info
-        info = await downloader.extract_info(url)
-        
-        if not info:
-            await status_msg.edit_text("❌ Failed to extract video information.")
-            return
-        
-        # Store info in user state
-        user_states[user_id] = {
-            'url': url,
-            'info': info,
-            'status_msg_id': status_msg.message_id
-        }
-        
-        # Show video info and options
-        title = info.get('title', 'Unknown')
-        duration = format_duration(info.get('duration'))
-        uploader = info.get('uploader', 'Unknown')
-        
-        info_text = f"""
-📹 **Video Information**
-
-**Title:** {title}
-**Duration:** {duration}
-**Uploader:** {uploader}
-
-What would you like to download?
-"""
-        
-        keyboard = [
-            [InlineKeyboardButton("🎬 Video", callback_data="download_video")],
-            [InlineKeyboardButton("🎵 Audio (MP3)", callback_data="download_audio")],
-            [InlineKeyboardButton("🖼 Thumbnail", callback_data="download_thumbnail")],
-            [InlineKeyboardButton("❌ Cancel", callback_data="download_cancel")]
-        ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        
-        await status_msg.edit_text(info_text, reply_markup=reply_markup, parse_mode=ParseMode.MARKDOWN)
-        
-    except Exception as e:
-        await status_msg.edit_text(f"❌ Error: {str(e)}")
+async def settings_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Display main settings menu."""
+    keyboard = [
+        [InlineKeyboardButton("🎬 Default Video Quality", callback_data="set_quality")],
+        [InlineKeyboardButton("🔁 Download Mode", callback_data="set_mode")],
+        [InlineKeyboardButton("🧹 Cleanup Timer", callback_data="set_cleanup")],
+        [InlineKeyboardButton("❌ Close", callback_data="close_settings")],
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await update.message.reply_text("⚙ Settings:", reply_markup=reply_markup)
 
 
-async def handle_search_query(update: Update, context: ContextTypes.DEFAULT_TYPE, query: str):
-    """Handle search query"""
-    user_id = update.effective_user.id
-    
-    status_msg = await update.message.reply_text(f"🔍 Searching for: **{query}**...", parse_mode=ParseMode.MARKDOWN)
-    
-    try:
-        results = await downloader.search_youtube(query, max_results=5)
-        
-        if not results:
-            await status_msg.edit_text("❌ No results found. Try a different search term.")
-            return
-        
-        # Show search results
-        keyboard = []
-        for idx, video in enumerate(results, 1):
-            title = video.get('title', 'Unknown')[:50]  # Truncate long titles
-            duration = format_duration(video.get('duration'))
-            button_text = f"{idx}. {title} ({duration})"
-            callback_data = f"search_select_{idx-1}"
-            keyboard.append([InlineKeyboardButton(button_text, callback_data=callback_data)])
-        
-        keyboard.append([InlineKeyboardButton("❌ Cancel", callback_data="search_cancel")])
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        
-        # Store search results in user state
-        user_states[user_id] = {
-            'search_results': results,
-            'status_msg_id': status_msg.message_id
-        }
-        
-        await status_msg.edit_text(
-            f"🔍 **Search Results for:** {query}\n\nSelect a video:",
-            reply_markup=reply_markup,
-            parse_mode=ParseMode.MARKDOWN
-        )
-        
-    except Exception as e:
-        await status_msg.edit_text(f"❌ Search error: {str(e)}")
-
-
-# ==================== CALLBACK QUERY HANDLERS ====================
-
-async def callback_query_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle all callback queries"""
+# ---------- Settings Callback Handlers ----------
+async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Route settings sub‑menus."""
     query = update.callback_query
     await query.answer()
-    
-    user_id = update.effective_user.id
     data = query.data
-    
-    # Settings callbacks
-    if data.startswith("setting_"):
-        await handle_setting_callback(update, context, data)
-    
-    # Download callbacks
-    elif data.startswith("download_"):
-        await handle_download_callback(update, context, data)
-    
-    # Quality selection callbacks
-    elif data.startswith("quality_"):
-        await handle_quality_callback(update, context, data)
-    
-    # Search callbacks
-    elif data.startswith("search_"):
-        await handle_search_callback(update, context, data)
-
-
-async def handle_setting_callback(update: Update, context: ContextTypes.DEFAULT_TYPE, data: str):
-    """Handle settings menu callbacks"""
-    query = update.callback_query
-    user_id = update.effective_user.id
-    
-    if data == "setting_quality":
-        keyboard = [
-            [InlineKeyboardButton("360p", callback_data="setquality_360p")],
-            [InlineKeyboardButton("480p", callback_data="setquality_480p")],
-            [InlineKeyboardButton("720p", callback_data="setquality_720p")],
-            [InlineKeyboardButton("1080p", callback_data="setquality_1080p")],
-            [InlineKeyboardButton("Best Available", callback_data="setquality_Best Available")],
-            [InlineKeyboardButton("« Back", callback_data="setting_back")]
-        ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        await query.edit_message_text(
-            "🎬 **Select Default Video Quality:**\n\nThis will be used when in Fixed Quality mode.",
-            reply_markup=reply_markup,
-            parse_mode=ParseMode.MARKDOWN
-        )
-    
-    elif data == "setting_cleanup":
-        keyboard = [
-            [InlineKeyboardButton("5 Minutes", callback_data="setcleanup_5 Minutes")],
-            [InlineKeyboardButton("10 Minutes", callback_data="setcleanup_10 Minutes")],
-            [InlineKeyboardButton("15 Minutes", callback_data="setcleanup_15 Minutes")],
-            [InlineKeyboardButton("30 Minutes", callback_data="setcleanup_30 Minutes")],
-            [InlineKeyboardButton("♾ Never", callback_data="setcleanup_♾ Never")],
-            [InlineKeyboardButton("« Back", callback_data="setting_back")]
-        ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        await query.edit_message_text(
-            "🧹 **Select Cleanup Timer:**\n\nFiles will be auto-deleted from server after this duration.",
-            reply_markup=reply_markup,
-            parse_mode=ParseMode.MARKDOWN
-        )
-    
-    elif data == "setting_mode":
-        keyboard = [
-            [InlineKeyboardButton("✅ Fixed Quality", callback_data="setmode_Fixed Quality")],
-            [InlineKeyboardButton("🎛 Manual Selection", callback_data="setmode_Manual Selection")],
-            [InlineKeyboardButton("« Back", callback_data="setting_back")]
-        ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        await query.edit_message_text(
-            "🔁 **Select Download Mode:**\n\n"
-            "**Fixed Quality:** Uses your default quality automatically\n"
-            "**Manual Selection:** Shows quality options for each download",
-            reply_markup=reply_markup,
-            parse_mode=ParseMode.MARKDOWN
-        )
-    
-    elif data.startswith("setquality_"):
-        quality = data.replace("setquality_", "")
-        await settings_manager.update_setting(user_id, "default_quality", quality)
-        await query.answer(f"✅ Default quality set to {quality}", show_alert=True)
-        await show_settings_menu(query)
-    
-    elif data.startswith("setcleanup_"):
-        timer = data.replace("setcleanup_", "")
-        await settings_manager.update_setting(user_id, "cleanup_timer", timer)
-        await query.answer(f"✅ Cleanup timer set to {timer}", show_alert=True)
-        await show_settings_menu(query)
-    
-    elif data.startswith("setmode_"):
-        mode = data.replace("setmode_", "")
-        await settings_manager.update_setting(user_id, "download_mode", mode)
-        await query.answer(f"✅ Download mode set to {mode}", show_alert=True)
-        await show_settings_menu(query)
-    
-    elif data == "setting_back":
-        await show_settings_menu(query)
-    
-    elif data == "setting_close":
-        await query.edit_message_text("⚙️ Settings closed.")
-
-
-async def show_settings_menu(query):
-    """Show main settings menu"""
     user_id = query.from_user.id
-    user_settings = await settings_manager.get_user_settings(user_id)
-    
-    keyboard = [
-        [InlineKeyboardButton("🎬 Default Video Quality", callback_data="setting_quality")],
-        [InlineKeyboardButton("🧹 Cleanup Timer", callback_data="setting_cleanup")],
-        [InlineKeyboardButton("🔁 Download Mode", callback_data="setting_mode")],
-        [InlineKeyboardButton("❌ Close", callback_data="setting_close")]
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    
-    settings_text = f"""
-⚙️ **Your Current Settings**
+    settings = get_user_settings(user_id)
 
-🎬 **Default Quality:** {user_settings['default_quality']}
-🧹 **Cleanup Timer:** {user_settings['cleanup_timer']}
-🔁 **Download Mode:** {user_settings['download_mode']}
-
-Tap a setting to change it:
-"""
-    
-    await query.edit_message_text(
-        settings_text,
-        reply_markup=reply_markup,
-        parse_mode=ParseMode.MARKDOWN
-    )
-
-
-async def handle_download_callback(update: Update, context: ContextTypes.DEFAULT_TYPE, data: str):
-    """Handle download option callbacks"""
-    query = update.callback_query
-    user_id = update.effective_user.id
-    
-    if user_id not in user_states:
-        await query.edit_message_text("❌ Session expired. Please send the URL again.")
-        return
-    
-    state = user_states[user_id]
-    
-    if data == "download_video":
-        # Check download mode
-        download_mode = await settings_manager.get_setting(user_id, "download_mode")
-        
-        if download_mode == "Fixed Quality":
-            # Use default quality directly
-            default_quality = await settings_manager.get_setting(user_id, "default_quality")
-            format_selector = downloader.get_format_selector(default_quality)
-            
-            # Start download
-            await query.edit_message_text(f"📥 Downloading in {default_quality}...")
-            await start_video_download(update, context, format_selector)
-        else:
-            # Show quality options
-            await show_quality_options(update, context)
-    
-    elif data == "download_audio":
-        await query.edit_message_text("🎵 Starting audio download and conversion...")
-        await start_audio_download(update, context)
-    
-    elif data == "download_thumbnail":
-        await query.edit_message_text("🖼 Downloading thumbnail...")
-        await start_thumbnail_download(update, context)
-    
-    elif data == "download_cancel":
-        await query.edit_message_text("❌ Download cancelled.")
-        if user_id in user_states:
-            del user_states[user_id]
-
-
-async def show_quality_options(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Show available quality options"""
-    query = update.callback_query
-    user_id = update.effective_user.id
-    
-    state = user_states.get(user_id)
-    if not state:
-        return
-    
-    info = state['info']
-    formats = downloader.get_available_formats(info)
-    
-    if not formats:
-        await query.edit_message_text("❌ No video formats available.")
-        return
-    
-    # Create quality buttons
-    keyboard = []
-    for fmt in formats:
-        button_text = f"{fmt['label']}"
-        callback_data = f"quality_{fmt['height']}"
-        keyboard.append([InlineKeyboardButton(button_text, callback_data=callback_data)])
-    
-    keyboard.append([InlineKeyboardButton("🌟 Best Available", callback_data="quality_best")])
-    keyboard.append([InlineKeyboardButton("❌ Cancel", callback_data="download_cancel")])
-    
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    
-    await query.edit_message_text(
-        "🎬 **Select Video Quality:**",
-        reply_markup=reply_markup,
-        parse_mode=ParseMode.MARKDOWN
-    )
-
-
-async def handle_quality_callback(update: Update, context: ContextTypes.DEFAULT_TYPE, data: str):
-    """Handle quality selection"""
-    query = update.callback_query
-    user_id = update.effective_user.id
-    
-    quality = data.replace("quality_", "")
-    
-    if quality == "best":
-        format_selector = "best"
-        quality_label = "Best Available"
-    else:
-        format_selector = f"best[height<={quality}]"
-        quality_label = f"{quality}p"
-    
-    await query.edit_message_text(f"📥 Downloading in {quality_label}...")
-    await start_video_download(update, context, format_selector)
-
-
-async def handle_search_callback(update: Update, context: ContextTypes.DEFAULT_TYPE, data: str):
-    """Handle search result selection"""
-    query = update.callback_query
-    user_id = update.effective_user.id
-    
-    if data == "search_cancel":
-        await query.edit_message_text("❌ Search cancelled.")
-        if user_id in user_states:
-            del user_states[user_id]
-        return
-    
-    # Extract selected index
-    index = int(data.replace("search_select_", ""))
-    
-    state = user_states.get(user_id)
-    if not state or 'search_results' not in state:
-        await query.edit_message_text("❌ Session expired. Please search again.")
-        return
-    
-    selected_video = state['search_results'][index]
-    video_url = selected_video.get('url') or f"https://youtube.com/watch?v={selected_video['id']}"
-    
-    # Process as normal YouTube URL
-    await query.edit_message_text("🔍 Loading selected video...")
-    
-    try:
-        info = await downloader.extract_info(video_url)
-        
-        # Update state
-        user_states[user_id] = {
-            'url': video_url,
-            'info': info,
-            'status_msg_id': query.message.message_id
-        }
-        
-        # Show video options
-        title = info.get('title', 'Unknown')
-        duration = format_duration(info.get('duration'))
-        
-        info_text = f"""
-📹 **Video Information**
-
-**Title:** {title}
-**Duration:** {duration}
-
-What would you like to download?
-"""
-        
+    if data == "set_quality":
+        current = settings["default_quality"]
         keyboard = [
-            [InlineKeyboardButton("🎬 Video", callback_data="download_video")],
-            [InlineKeyboardButton("🎵 Audio (MP3)", callback_data="download_audio")],
-            [InlineKeyboardButton("🖼 Thumbnail", callback_data="download_thumbnail")],
-            [InlineKeyboardButton("❌ Cancel", callback_data="download_cancel")]
+            [InlineKeyboardButton(f"360p {'✅' if current=='360p' else ''}", callback_data="quality_360p")],
+            [InlineKeyboardButton(f"480p {'✅' if current=='480p' else ''}", callback_data="quality_480p")],
+            [InlineKeyboardButton(f"720p {'✅' if current=='720p' else ''}", callback_data="quality_720p")],
+            [InlineKeyboardButton(f"1080p {'✅' if current=='1080p' else ''}", callback_data="quality_1080p")],
+            [InlineKeyboardButton(f"Best Available {'✅' if current=='best' else ''}", callback_data="quality_best")],
+            [InlineKeyboardButton("🔙 Back", callback_data="back_settings")],
         ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        
-        await query.edit_message_text(info_text, reply_markup=reply_markup, parse_mode=ParseMode.MARKDOWN)
-        
-    except Exception as e:
-        await query.edit_message_text(f"❌ Error: {str(e)}")
+        await query.edit_message_text("🎬 Select default video quality:", reply_markup=InlineKeyboardMarkup(keyboard))
 
+    elif data.startswith("quality_"):
+        quality = data.split("_", 1)[1]  # e.g., "720p"
+        update_user_setting(user_id, "default_quality", quality)
+        await query.edit_message_text(f"✅ Default quality set to: {quality}")
 
-# ==================== DOWNLOAD FUNCTIONS ====================
+    elif data == "set_mode":
+        current = settings["download_mode"]
+        fixed_text = "✅ Fixed Quality (use default)" if current == "fixed" else "Fixed Quality (use default)"
+        manual_text = "🎛 Manual Selection" if current == "manual" else "Manual Selection"
+        keyboard = [
+            [InlineKeyboardButton(fixed_text, callback_data="mode_fixed")],
+            [InlineKeyboardButton(manual_text, callback_data="mode_manual")],
+            [InlineKeyboardButton("🔙 Back", callback_data="back_settings")],
+        ]
+        await query.edit_message_text("🔁 Choose download mode:", reply_markup=InlineKeyboardMarkup(keyboard))
 
-async def start_video_download(update: Update, context: ContextTypes.DEFAULT_TYPE, format_selector: str):
-    """Start video download with progress updates"""
-    query = update.callback_query
-    user_id = update.effective_user.id
-    
-    state = user_states.get(user_id)
-    if not state:
+    elif data.startswith("mode_"):
+        mode = data.split("_", 1)[1]
+        update_user_setting(user_id, "download_mode", mode)
+        mode_display = "Fixed Quality" if mode == "fixed" else "Manual Selection"
+        await query.edit_message_text(f"✅ Download mode set to: {mode_display}")
+
+    elif data == "set_cleanup":
+        current = settings["cleanup_timer"]
+        options = [5, 10, 15, 30, None]  # None = never
+        labels = {
+            5: "5 Minutes",
+            10: "10 Minutes",
+            15: "15 Minutes",
+            30: "30 Minutes",
+            None: "♾ Never",
+        }
+        keyboard = []
+        for val in options:
+            text = labels[val]
+            if val == current:
+                text = f"{text} ✅"
+            keyboard.append([InlineKeyboardButton(text, callback_data=f"cleanup_{val}")])
+        keyboard.append([InlineKeyboardButton("🔙 Back", callback_data="back_settings")])
+        await query.edit_message_text("🧹 Auto‑delete files after:", reply_markup=InlineKeyboardMarkup(keyboard))
+
+    elif data.startswith("cleanup_"):
+        val = data.split("_", 1)[1]
+        cleanup = int(val) if val != "None" else None
+        update_user_setting(user_id, "cleanup_timer", cleanup)
+        await query.edit_message_text(f"✅ Cleanup timer set to: {'Never' if cleanup is None else f'{cleanup} min'}")
+
+    elif data == "back_settings":
+        # Go back to main settings menu
+        await settings_command(update, context)
+        await query.delete_message()
         return
-    
-    url = state['url']
-    
-    # Progress callback
-    async def progress_callback(message: str):
+
+    elif data == "close_settings":
+        await query.edit_message_text("Settings closed.")
+        await query.delete_message()
+
+
+# ---------- URL / Search Handler ----------
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Receive text messages and decide action."""
+    text = update.message.text.strip()
+    user_id = update.effective_user.id
+
+    if is_youtube_url(text):
+        # Show media type selection
+        keyboard = [
+            [InlineKeyboardButton("🎬 Video", callback_data=f"type_video|{text}")],
+            [InlineKeyboardButton("🎵 Audio (MP3)", callback_data=f"type_audio|{text}")],
+            [InlineKeyboardButton("🖼 Thumbnail", callback_data=f"type_thumb|{text}")],
+            [InlineKeyboardButton("❌ Cancel", callback_data="type_cancel")],
+        ]
+        await update.message.reply_text(
+            "What would you like to download?",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+        )
+    else:
+        # Search YouTube for the query
+        progress_msg = await update.message.reply_text("🔍 Searching YouTube...")
         try:
-            await query.edit_message_text(message, parse_mode=ParseMode.MARKDOWN)
-        except Exception:
-            pass  # Ignore rate limit errors
-    
-    try:
-        # Download video
-        filepath = await downloader.download_video(url, format_selector, progress_callback)
-        
-        # Send as document
-        await query.edit_message_text("📤 Uploading to Telegram...")
-        
-        with open(filepath, 'rb') as video_file:
-            await context.bot.send_document(
-                chat_id=query.message.chat_id,
-                document=video_file,
-                caption=f"🎬 {os.path.basename(filepath)}",
-                reply_to_message_id=query.message.message_id
+            loop = asyncio.get_running_loop()
+            with YoutubeDL({"quiet": True, "extract_flat": True}) as ydl:
+                # ytsearch5: returns up to 5 results with basic info
+                info = await loop.run_in_executor(None, lambda: ydl.extract_info(f"ytsearch5:{text}", download=False))
+            entries = info.get("entries", [])
+            if not entries:
+                await progress_msg.edit_text("❌ No results found.")
+                return
+
+            keyboard = []
+            for vid in entries[:5]:
+                title = vid.get("title", "No Title")
+                vid_url = vid.get("webpage_url") or f"https://youtu.be/{vid['id']}"
+                # Truncate long titles
+                if len(title) > 50:
+                    title = title[:47] + "..."
+                keyboard.append([InlineKeyboardButton(title, callback_data=f"search_result|{vid_url}")])
+            keyboard.append([InlineKeyboardButton("❌ Cancel", callback_data="search_cancel")])
+            await progress_msg.edit_text(
+                "🎵 Top results:",
+                reply_markup=InlineKeyboardMarkup(keyboard),
             )
-        
-        await query.edit_message_text("✅ Video sent successfully!")
-        
-        # Schedule cleanup
-        cleanup_timer = await settings_manager.get_setting(user_id, "cleanup_timer")
-        await cleanup_scheduler.schedule_cleanup(filepath, user_id, cleanup_timer)
-        
-    except Exception as e:
-        await query.edit_message_text(f"❌ Download failed: {str(e)}")
-    finally:
-        if user_id in user_states:
-            del user_states[user_id]
+        except Exception as e:
+            await progress_msg.edit_text(f"❌ Search failed: {e}")
 
 
-async def start_audio_download(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Start audio download and conversion"""
+# ---------- Media Type / Search Selection Callback ----------
+async def media_type_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle the initial video/audio/thumbnail choice or search result click."""
     query = update.callback_query
-    user_id = update.effective_user.id
-    
-    state = user_states.get(user_id)
-    if not state:
+    await query.answer()
+    data = query.data
+
+    if data == "type_cancel" or data == "search_cancel":
+        await query.edit_message_text("❌ Cancelled.")
         return
-    
-    url = state['url']
-    
-    # Progress callback
-    async def progress_callback(message: str):
-        try:
-            await query.edit_message_text(message, parse_mode=ParseMode.MARKDOWN)
-        except Exception:
-            pass
-    
-    try:
-        # Download and convert to MP3
-        filepath = await downloader.download_audio(url, progress_callback)
-        
-        # Send as document
-        await query.edit_message_text("📤 Uploading MP3...")
-        
-        with open(filepath, 'rb') as audio_file:
-            await context.bot.send_document(
-                chat_id=query.message.chat_id,
-                document=audio_file,
-                caption=f"🎵 {os.path.basename(filepath)}",
-                reply_to_message_id=query.message.message_id
-            )
-        
-        await query.edit_message_text("✅ MP3 sent successfully!")
-        
-        # Schedule cleanup
-        cleanup_timer = await settings_manager.get_setting(user_id, "cleanup_timer")
-        await cleanup_scheduler.schedule_cleanup(filepath, user_id, cleanup_timer)
-        
-    except Exception as e:
-        await query.edit_message_text(f"❌ Audio download failed: {str(e)}")
-    finally:
-        if user_id in user_states:
-            del user_states[user_id]
 
+    if data.startswith("type_"):
+        _, media_type, url = data.split("|", 2)
+        user_id = query.from_user.id
+        settings = get_user_settings(user_id)
 
-      async def start_thumbnail_download(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Start thumbnail download"""
-    query = update.callback_query
-    user_id = update.effective_user.id
-    
-    state = user_states.get(user_id)
-    if not state:
-        return
-    
-    info = state['info']
-    
-    try:
-        # Download thumbnail
-        filepath = await downloader.download_thumbnail(info)
-        
-        # Send as document
-        await query.edit_message_text("📤 Uploading thumbnail...")
-        
-        with open(filepath, 'rb') as thumb_file:
-            await context.bot.send_document(
-                chat_id=query.message.chat_id,
-                document=thumb_file,
-                caption=f"🖼 {os.path.basename(filepath)}",
-                reply_to_message_id=query.message.message_id
-            )
-        
-        await query.edit_message_text("✅ Thumbnail sent successfully!")
-        
-        # Schedule cleanup
-        cleanup_timer = await settings_manager.get_setting(user_id, "cleanup_timer")
-        await cleanup_scheduler.schedule_cleanup(filepath, user_id, cleanup_timer)
-        
-    except Exception as e:
-        await query.edit_message_text(f"❌ Thumbnail download failed: {str(e)}")
-    finally:
-        if user_id in user_states:
-            del user_states[user_id]
+        if media_type == "video":
+            mode = settings["download_mode"]
+            if mode == "fixed":
+                quality = settings["default_quality"]
+                await query.edit_message_text(f"⏳ Downloading video in {quality}...")
+                await download_media(update, context, url, "video", quality=quality)
+            else:
+                # Manual: fetch dynamic formats and show buttons
+                await query.edit_message_text("🔍 Fetching available qualities...")
+                try:
+                    loop = asyncio.get_running_loop()
+                    with YoutubeDL({"quiet": True}) as ydl:
+                        info = await loop.run_in_executor(None, lambda: ydl.extract_info(url, download=False))
+                    formats = info.get("formats", [])
+                    # Build quality buttons (unique heights, sorted)
+                    seen = set()
+                    heights = []
+                    for f in formats:
+                        h = f.get("height")
+                        if h and h not in seen and f.get("ext") == "mp4":
+                            seen.add(h)
+                            heights.append(h)
+                    heights.sort()
+                    if not heights:
+                        # fallback to "best"
+                        await query.edit_message_text("⚠ No MP4 formats found, using best available.")
+                        await download_media(update, context, url, "video", quality="best")
+                        return
 
+                    buttons = []
+                    for h in heights:
+                        buttons.append([InlineKeyboardButton(f"{h}p", callback_data=f"quality_manual|{url}|{h}")])
+                    buttons.append([InlineKeyboardButton("Best Available", callback_data=f"quality_manual|{url}|best")])
+                    buttons.append([InlineKeyboardButton("❌ Cancel", callback_data="type_cancel")])
+                    await query.edit_message_text(
+                        "🎬 Choose video quality:",
+                        reply_markup=InlineKeyboardMarkup(buttons),
+                    )
+                except Exception as e:
+                    await query.edit_message_text(f"❌ Could not fetch formats: {e}")
 
-      # ==================== ERROR HANDLER ====================
+        elif media_type == "audio":
+            await query.edit_message_text("🎵 Downloading MP3...")
+            await download_media(update, context, url, "audio")
 
-async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle errors"""
-    logger.error(f"Update {update} caused error {context.error}")
-    
-    if update and update.effective_message:
-        await update.effective_message.reply_text(
-            "❌ An unexpected error occurred. Please try again later."
+        elif media_type == "thumb":
+            await query.edit_message_text("🖼 Downloading thumbnail...")
+            await download_media(update, context, url, "thumbnail")
+
+    elif data.startswith("quality_manual"):
+        _, url, quality = data.split("|")
+        await query.edit_message_text(f"⬇ Downloading video in {quality}...")
+        await download_media(update, context, url, "video", quality=quality)
+
+    elif data.startswith("search_result"):
+        # Treat as a URL click from search results – show media type menu
+        _, vid_url = data.split("|", 1)
+        keyboard = [
+            [InlineKeyboardButton("🎬 Video", callback_data=f"type_video|{vid_url}")],
+            [InlineKeyboardButton("🎵 Audio (MP3)", callback_data=f"type_audio|{vid_url}")],
+            [InlineKeyboardButton("🖼 Thumbnail", callback_data=f"type_thumb|{vid_url}")],
+            [InlineKeyboardButton("❌ Cancel", callback_data="type_cancel")],
+        ]
+        await query.edit_message_text(
+            "What would you like to download?",
+            reply_markup=InlineKeyboardMarkup(keyboard),
         )
 
 
-# ==================== MAIN ====================
+# ---------- Main ----------
+def main() -> None:
+    """Start the bot."""
+    # Load existing settings
+    load_settings()
 
+    # Build application
+    app = Application.builder().token(BOT_TOKEN).build()
 
-def main():
-    """Start the bot"""
-    # Create application
-    application = Application.builder().token(BOT_TOKEN).build()
-    
-    # Add handlers
-    application.add_handler(CommandHandler("start", start_command))
-    application.add_handler(CommandHandler("help", help_command))
-    application.add_handler(CommandHandler("settings", settings_command))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    application.add_handler(CallbackQueryHandler(callback_query_handler))
-    
-    # Add error handler
-    application.add_error_handler(error_handler)
-    
-    # Start bot
-    logger.info("🤖 Bot starting...")
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
+    # Register handlers
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("settings", settings_command))
+    app.add_handler(CallbackQueryHandler(settings_callback, pattern="^(set_|quality_|mode_|cleanup_|back_settings|close_settings)"))
+    app.add_handler(CallbackQueryHandler(media_type_callback, pattern="^(type_|search_|quality_manual|search_cancel|type_cancel)"))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+
+    # Start polling
+    logger.info("Bot started. Press Ctrl+C to stop.")
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
 if __name__ == "__main__":
     main()
-          
