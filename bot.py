@@ -31,6 +31,25 @@ from telegram.ext import (
 from yt_dlp import YoutubeDL
 from yt_dlp.utils import DownloadError, ExtractorError
 
+# ---------- Optional: Health check HTTP server (for Render Web Service) ----------
+# If you use a Render Web Service (not Worker), you need to bind to PORT.
+# Set ENABLE_HEALTH_SERVER=True in env vars to activate this.
+if os.environ.get("ENABLE_HEALTH_SERVER", "").lower() == "true":
+    from aiohttp import web
+
+    async def health(request):
+        return web.Response(text="OK")
+
+    async def start_health_server(port: int):
+        app = web.Application()
+        app.router.add_get("/", health)   # Render checks GET /
+        app.router.add_get("/health", health)
+        runner = web.AppRunner(app)
+        await runner.setup()
+        site = web.TCPSite(runner, "0.0.0.0", port)
+        await site.start()
+        logging.info(f"Health server running on port {port}")
+
 # ---------- Configuration ----------
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 if not BOT_TOKEN:
@@ -47,26 +66,21 @@ logger = logging.getLogger(__name__)
 SETTINGS_FILE = Path("settings.json")
 
 DEFAULT_SETTINGS = {
-    "default_quality": "720p",       # 360p, 480p, 720p, 1080p, best
-    "download_mode": "manual",       # fixed or manual
-    "cleanup_timer": 10,             # minutes (None = never)
+    "default_quality": "720p",
+    "download_mode": "manual",
+    "cleanup_timer": 10,
 }
 
-# In‑memory cache: user_id -> settings dict
 user_settings: Dict[int, dict] = {}
-
-# Track active cleanup tasks: {user_id: asyncio.Task}
 cleanup_tasks: Dict[int, asyncio.Task] = {}
 
 
 def load_settings() -> None:
-    """Load settings from JSON file into global cache."""
     global user_settings
     if SETTINGS_FILE.exists():
         try:
             with open(SETTINGS_FILE, "r") as f:
                 user_settings = json.load(f)
-                # Convert string keys back to int (JSON keys are strings)
                 user_settings = {int(k): v for k, v in user_settings.items()}
             logger.info("Settings loaded from disk")
         except Exception as e:
@@ -76,7 +90,6 @@ def load_settings() -> None:
 
 
 def save_settings() -> None:
-    """Persist current settings cache to JSON file."""
     try:
         with open(SETTINGS_FILE, "w") as f:
             json.dump(user_settings, f, indent=2)
@@ -85,7 +98,6 @@ def save_settings() -> None:
 
 
 def get_user_settings(user_id: int) -> dict:
-    """Return settings for a user, filling defaults if missing."""
     if user_id not in user_settings:
         user_settings[user_id] = DEFAULT_SETTINGS.copy()
         save_settings()
@@ -93,7 +105,6 @@ def get_user_settings(user_id: int) -> dict:
 
 
 def update_user_setting(user_id: int, key: str, value: Any) -> None:
-    """Update a single setting and persist."""
     settings = get_user_settings(user_id)
     settings[key] = value
     save_settings()
@@ -110,7 +121,6 @@ QUALITY_TO_FORMAT = {
 
 
 def quality_to_ytdl_format(quality: str) -> str:
-    """Translate a quality label to a yt-dlp format string."""
     return QUALITY_TO_FORMAT.get(quality, QUALITY_TO_FORMAT["best"])
 
 
@@ -119,18 +129,13 @@ YOUTUBE_URL_RE = re.compile(
     r"(https?://)?(www\.)?(youtube\.com/watch\?v=|youtu\.be/|youtube\.com/shorts/)[\w-]+"
 )
 
-YT_SEARCH_PREFIX = "ytsearch5:"
-
 
 def is_youtube_url(text: str) -> bool:
-    """Check if text is a YouTube video URL."""
     return bool(YOUTUBE_URL_RE.search(text))
 
 
-# ---------- Progress Hook (thread‑safe) ----------
+# ---------- Progress Hook ----------
 class ProgressHook:
-    """Thread‑safe progress hook that edits a Telegram message."""
-
     def __init__(self, bot, chat_id: int, message_id: int):
         self.bot = bot
         self.chat_id = chat_id
@@ -155,7 +160,6 @@ class ProgressHook:
 
         if text != self.last_text:
             self.last_text = text
-            # Schedule the message edit in the main event loop
             asyncio.run_coroutine_threadsafe(
                 self._edit_message(text),
                 self.bot.loop,
@@ -177,36 +181,29 @@ async def download_media(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
     url: str,
-    media_type: str,          # "video", "audio", "thumbnail"
-    quality: Optional[str] = None,  # only for video, e.g. "720p"
+    media_type: str,
+    quality: Optional[str] = None,
 ) -> None:
-    """
-    Download media in background, send as document, apply cleanup.
-    """
     user_id = update.effective_user.id
     settings = get_user_settings(user_id)
     chat_id = update.effective_chat.id
 
-    # Create temporary directory for this download
     tmp_dir = tempfile.mkdtemp(prefix="ytdl_", dir=".")
-    # Unique file name base (yt-dlp will append extensions)
     outtmpl = os.path.join(tmp_dir, "%(title).100s_%(id)s.%(ext)s")
 
-    # Build progress message
     progress_msg = await context.bot.send_message(
         chat_id=chat_id,
         text="⏳ Starting download...",
     )
     progress_callback = ProgressHook(context.bot, chat_id, progress_msg.message_id)
 
-    # yt-dlp options
     ydl_opts = {
         "outtmpl": outtmpl,
         "quiet": True,
         "no_warnings": True,
         "progress_hooks": [progress_callback],
-        "cookiefile": "cookies.txt",  # optional, for age‑restricted content
-        "merge_output_format": "mp4",  # ensure final merge is mp4
+        "cookiefile": "cookies.txt",
+        "merge_output_format": "mp4",
     }
 
     if media_type == "audio":
@@ -221,37 +218,30 @@ async def download_media(
             ],
         })
     elif media_type == "video":
-        # If quality specified, use that; otherwise best
         fmt = quality_to_ytdl_format(quality) if quality else quality_to_ytdl_format("best")
         ydl_opts["format"] = fmt
         ydl_opts.setdefault("postprocessors", [])
-        # Ensure we merge video+audio if needed
         ydl_opts["postprocessors"].append({"key": "FFmpegVideoConvertor", "preferedformat": "mp4"})
     elif media_type == "thumbnail":
-        # Download only thumbnail
         ydl_opts.update({
             "writethumbnail": True,
-            "skip_download": True,  # don't download video
+            "skip_download": True,
         })
     else:
         raise ValueError("Invalid media type")
 
     try:
-        # Run yt-dlp in a thread to avoid blocking the event loop
         loop = asyncio.get_running_loop()
         with YoutubeDL(ydl_opts) as ydl:
             info = await loop.run_in_executor(None, lambda: ydl.extract_info(url, download=True))
 
-        # Find downloaded file(s)
         downloaded_files = []
         if media_type == "thumbnail":
-            # Thumbnail file is named like the video title + ".jpg" (or .png)
             for f in os.listdir(tmp_dir):
                 if f.endswith((".jpg", ".jpeg", ".png", ".webp")):
                     downloaded_files.append(os.path.join(tmp_dir, f))
                     break
         else:
-            # All other files in tmp_dir
             for f in os.listdir(tmp_dir):
                 fp = os.path.join(tmp_dir, f)
                 if os.path.isfile(fp):
@@ -262,7 +252,6 @@ async def download_media(
             shutil.rmtree(tmp_dir, ignore_errors=True)
             return
 
-        # Send each file as document
         for file_path in downloaded_files:
             with open(file_path, "rb") as f:
                 await context.bot.send_document(
@@ -274,22 +263,17 @@ async def download_media(
 
         await progress_msg.delete()
 
-        # Schedule cleanup based on user settings
         cleanup_minutes = settings.get("cleanup_timer")
         if cleanup_minutes is not None:
-            # Cancel any previous cleanup task for the user (just in case)
             if user_id in cleanup_tasks and not cleanup_tasks[user_id].done():
                 cleanup_tasks[user_id].cancel()
-            # Schedule deletion
             async def _cleanup():
                 await asyncio.sleep(cleanup_minutes * 60)
                 shutil.rmtree(tmp_dir, ignore_errors=True)
                 logger.info(f"Cleaned up files for user {user_id}")
-
             task = asyncio.create_task(_cleanup())
             cleanup_tasks[user_id] = task
         else:
-            # "Never" – leave files
             logger.info(f"Skipping cleanup for user {user_id} (timer = Never)")
 
     except (DownloadError, ExtractorError) as e:
@@ -312,7 +296,6 @@ async def download_media(
 
 # ---------- Handlers ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Send welcome message."""
     await update.message.reply_text(
         "👋 Welcome to the YouTube Downloader Bot!\n\n"
         "• Send a YouTube link to download video/audio/thumbnail.\n"
@@ -322,7 +305,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def settings_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Display main settings menu."""
     keyboard = [
         [InlineKeyboardButton("🎬 Default Video Quality", callback_data="set_quality")],
         [InlineKeyboardButton("🔁 Download Mode", callback_data="set_mode")],
@@ -333,9 +315,7 @@ async def settings_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     await update.message.reply_text("⚙ Settings:", reply_markup=reply_markup)
 
 
-# ---------- Settings Callback Handlers ----------
 async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Route settings sub‑menus."""
     query = update.callback_query
     await query.answer()
     data = query.data
@@ -355,7 +335,7 @@ async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         await query.edit_message_text("🎬 Select default video quality:", reply_markup=InlineKeyboardMarkup(keyboard))
 
     elif data.startswith("quality_"):
-        quality = data.split("_", 1)[1]  # e.g., "720p"
+        quality = data.split("_", 1)[1]
         update_user_setting(user_id, "default_quality", quality)
         await query.edit_message_text(f"✅ Default quality set to: {quality}")
 
@@ -378,14 +358,8 @@ async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
     elif data == "set_cleanup":
         current = settings["cleanup_timer"]
-        options = [5, 10, 15, 30, None]  # None = never
-        labels = {
-            5: "5 Minutes",
-            10: "10 Minutes",
-            15: "15 Minutes",
-            30: "30 Minutes",
-            None: "♾ Never",
-        }
+        options = [5, 10, 15, 30, None]
+        labels = {5: "5 Minutes", 10: "10 Minutes", 15: "15 Minutes", 30: "30 Minutes", None: "♾ Never"}
         keyboard = []
         for val in options:
             text = labels[val]
@@ -402,10 +376,7 @@ async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         await query.edit_message_text(f"✅ Cleanup timer set to: {'Never' if cleanup is None else f'{cleanup} min'}")
 
     elif data == "back_settings":
-        # This approach won't work directly because we need to send a new message.
-        # Instead, we delete the current message and rely on user to re‑open /settings.
         await query.edit_message_text("Return to /settings to see the main menu again.")
-        # Alternatively, we can just delete it.
         await query.delete_message()
 
     elif data == "close_settings":
@@ -413,14 +384,9 @@ async def settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         await query.delete_message()
 
 
-# ---------- URL / Search Handler ----------
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Receive text messages and decide action."""
     text = update.message.text.strip()
-    user_id = update.effective_user.id
-
     if is_youtube_url(text):
-        # Show media type selection
         keyboard = [
             [InlineKeyboardButton("🎬 Video", callback_data=f"type_video|{text}")],
             [InlineKeyboardButton("🎵 Audio (MP3)", callback_data=f"type_audio|{text}")],
@@ -432,54 +398,48 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             reply_markup=InlineKeyboardMarkup(keyboard),
         )
     else:
-        # Search YouTube for the query
         progress_msg = await update.message.reply_text("🔍 Searching YouTube...")
         try:
             loop = asyncio.get_running_loop()
             with YoutubeDL({"quiet": True, "extract_flat": True}) as ydl:
-                # ytsearch5: returns up to 5 results with basic info
                 info = await loop.run_in_executor(None, lambda: ydl.extract_info(f"ytsearch5:{text}", download=False))
             entries = info.get("entries", [])
             if not entries:
                 await progress_msg.edit_text("❌ No results found.")
                 return
-
             keyboard = []
             for vid in entries[:5]:
                 title = vid.get("title", "No Title")
                 vid_url = vid.get("webpage_url") or f"https://youtu.be/{vid['id']}"
-                # Truncate long titles
                 if len(title) > 50:
                     title = title[:47] + "..."
                 keyboard.append([InlineKeyboardButton(title, callback_data=f"search_result|{vid_url}")])
             keyboard.append([InlineKeyboardButton("❌ Cancel", callback_data="search_cancel")])
-            await progress_msg.edit_text(
-                "🎵 Top results:",
-                reply_markup=InlineKeyboardMarkup(keyboard),
-            )
+            await progress_msg.edit_text("🎵 Top results:", reply_markup=InlineKeyboardMarkup(keyboard))
         except Exception as e:
             await progress_msg.edit_text(f"❌ Search failed: {e}")
 
 
-# ---------- Media Type / Search Selection Callback (FIXED) ----------
+# ------------------------------------------------------------
+# FIXED media_type_callback – NO unpacking error
+# ------------------------------------------------------------
 async def media_type_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle the initial video/audio/thumbnail choice or search result click."""
     query = update.callback_query
     await query.answer()
     data = query.data
 
-    if data == "type_cancel" or data == "search_cancel":
+    if data in ("type_cancel", "search_cancel"):
         await query.edit_message_text("❌ Cancelled.")
         return
 
     if data.startswith("type_"):
-        # FIX: data format is "type_video|URL" (2 parts), not 3.
+        # CORRECT PARSING: "type_video|URL" → 2 parts
         parts = data.split("|", 1)
         if len(parts) != 2:
             await query.edit_message_text("❌ Invalid selection.")
             return
         type_part, url = parts
-        media_type = type_part.split("_", 1)[1]  # "video", "audio", "thumb"
+        media_type = type_part.split("_", 1)[1]   # "video", "audio", "thumb"
         user_id = query.from_user.id
         settings = get_user_settings(user_id)
 
@@ -490,7 +450,6 @@ async def media_type_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
                 await query.edit_message_text(f"⏳ Downloading video in {quality}...")
                 await download_media(update, context, url, "video", quality=quality)
             else:
-                # Manual: fetch dynamic qualities
                 await query.edit_message_text("🔍 Fetching available qualities...")
                 try:
                     loop = asyncio.get_running_loop()
@@ -514,10 +473,7 @@ async def media_type_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
                         buttons.append([InlineKeyboardButton(f"{h}p", callback_data=f"quality_manual|{url}|{h}")])
                     buttons.append([InlineKeyboardButton("Best Available", callback_data=f"quality_manual|{url}|best")])
                     buttons.append([InlineKeyboardButton("❌ Cancel", callback_data="type_cancel")])
-                    await query.edit_message_text(
-                        "🎬 Choose video quality:",
-                        reply_markup=InlineKeyboardMarkup(buttons),
-                    )
+                    await query.edit_message_text("🎬 Choose video quality:", reply_markup=InlineKeyboardMarkup(buttons))
                 except Exception as e:
                     await query.edit_message_text(f"❌ Could not fetch formats: {e}")
 
@@ -530,13 +486,11 @@ async def media_type_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
             await download_media(update, context, url, "thumbnail")
 
     elif data.startswith("quality_manual"):
-        # data: "quality_manual|url|height"
         _, url, quality = data.split("|", 2)
         await query.edit_message_text(f"⬇ Downloading video in {quality}...")
         await download_media(update, context, url, "video", quality=quality)
 
     elif data.startswith("search_result"):
-        # data: "search_result|url"
         _, vid_url = data.split("|", 1)
         keyboard = [
             [InlineKeyboardButton("🎬 Video", callback_data=f"type_video|{vid_url}")],
@@ -544,17 +498,14 @@ async def media_type_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
             [InlineKeyboardButton("🖼 Thumbnail", callback_data=f"type_thumb|{vid_url}")],
             [InlineKeyboardButton("❌ Cancel", callback_data="type_cancel")],
         ]
-        await query.edit_message_text(
-            "What would you like to download?",
-            reply_markup=InlineKeyboardMarkup(keyboard),
-        )
+        await query.edit_message_text("What would you like to download?", reply_markup=InlineKeyboardMarkup(keyboard))
 
 
-# ---------- Error Handler (to prevent "No error handlers" log) ----------
+# ------------------------------------------------------------
+# ERROR HANDLER – stops "No error handlers" warning
+# ------------------------------------------------------------
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Log the error and send a friendly message to the user."""
     logger.error(msg="Exception while handling an update:", exc_info=context.error)
-    # If possible, notify the user
     if isinstance(update, Update) and update.effective_chat:
         try:
             await context.bot.send_message(
@@ -565,29 +516,40 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
             pass
 
 
-# ---------- Main ----------
-def main() -> None:
-    """Start the bot."""
-    # Load existing settings
+# ------------------------------------------------------------
+# MAIN
+# ------------------------------------------------------------
+async def main() -> None:
+    # Load settings
     load_settings()
 
-    # Build application
+    # Build PTB application
     app = Application.builder().token(BOT_TOKEN).build()
 
-    # Register handlers
+    # Handlers
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("settings", settings_command))
     app.add_handler(CallbackQueryHandler(settings_callback, pattern="^(set_|quality_|mode_|cleanup_|back_settings|close_settings)"))
     app.add_handler(CallbackQueryHandler(media_type_callback, pattern="^(type_|search_|quality_manual|search_cancel|type_cancel)"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    # Register the error handler
+    # ERROR HANDLER REGISTRATION (this was missing before)
     app.add_error_handler(error_handler)
 
-    # Start polling
+    # Optional health server (if ENABLE_HEALTH_SERVER=true)
+    if os.environ.get("ENABLE_HEALTH_SERVER", "").lower() == "true":
+        port = int(os.environ.get("PORT", 10000))
+        # Run health server in background
+        asyncio.create_task(start_health_server(port))
+
+    # Start bot
     logger.info("Bot started. Press Ctrl+C to stop.")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    await app.initialize()
+    await app.start()
+    await app.updater.start_polling(allowed_updates=Update.ALL_TYPES)
+    # Keep running
+    await asyncio.Event().wait()
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
